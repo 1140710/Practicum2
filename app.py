@@ -1,11 +1,10 @@
-
 import streamlit as st
 import joblib
 import numpy as np
 import sqlite3
 import pandas as pd
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- Database functies ---
 def init_db():
@@ -82,7 +81,8 @@ windspeed = st.slider('Windsnelheid (genormaliseerd)', 0.0, 1.0, 0.2)
 
 # Voorspelling
 if st.button('Voorspel'):
-    input_data = np.array([[yr, mnth, hr, holiday, weekday, workingday, weathersit, temp, hum, windspeed]])
+    input_data = pd.DataFrame([[yr, mnth, hr, holiday, weekday, workingday, weathersit, temp, hum, windspeed]], 
+                               columns=features)
     prediction = model.predict(input_data)[0]
     
     input_values = [yr, mnth, hr, holiday, weekday, workingday, weathersit, temp, hum, windspeed]
@@ -94,40 +94,47 @@ if st.button('Voorspel'):
 st.markdown('---')
 st.subheader('🔄 Simuleer voorspellingen met synthetische data')
 
+col1, col2 = st.columns(2)
+with col1:
+    sim_start = st.date_input('Startdatum simulatie', value=datetime.now().date() - timedelta(days=30))
+with col2:
+    sim_end = st.date_input('Einddatum simulatie', value=datetime.now().date() + timedelta(days=30))
+
 if st.button('Simuleer voorspellingen'):
-    if os.path.exists('data/synthetic_data.csv'):
-        synthetic_path = 'data/synthetic_data.csv'
-    elif os.path.exists('synthetic_data.csv'):
-        synthetic_path = 'synthetic_data.csv'
+    if sim_start >= sim_end:
+        st.error('Startdatum moet vóór einddatum liggen.')
     else:
-        synthetic_path = None
-    
-    if synthetic_path:
-        synthetic = pd.read_csv(synthetic_path)
-        predictions = model.predict(synthetic.values)
+        if os.path.exists('data/synthetic_data.csv'):
+            synthetic_path = 'data/synthetic_data.csv'
+        elif os.path.exists('synthetic_data.csv'):
+            synthetic_path = 'synthetic_data.csv'
+        else:
+            synthetic_path = None
         
-        # Gespreide timestamps over de afgelopen 30 dagen
-        end_time = datetime.now()
-        start_time = end_time - pd.Timedelta(days=30)
-        timestamps = pd.date_range(start=start_time, end=end_time, periods=len(synthetic))
-        
-        conn = sqlite3.connect('predictions.db')
-        c = conn.cursor()
-        for i, row in synthetic.iterrows():
-            c.execute('''
-                INSERT INTO predictions (timestamp, yr, mnth, hr, holiday, weekday, 
-                                          workingday, weathersit, temp, hum, windspeed, prediction, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (timestamps[i].strftime('%Y-%m-%d %H:%M:%S'), 
-                  int(row['yr']), int(row['mnth']), int(row['hr']), int(row['holiday']),
-                  int(row['weekday']), int(row['workingday']), int(row['weathersit']),
-                  row['temp'], row['hum'], row['windspeed'], predictions[i], 'synthetic'))
-        conn.commit()
-        conn.close()
-        
-        st.success(f'✅ {len(synthetic)} synthetische voorspellingen opgeslagen in de database!')
-    else:
-        st.error('Synthetische dataset niet gevonden.')
+        if synthetic_path:
+            synthetic = pd.read_csv(synthetic_path)
+            predictions = model.predict(synthetic[features])
+            
+            # Gespreide timestamps over de gekozen periode
+            timestamps = pd.date_range(start=sim_start, end=sim_end, periods=len(synthetic))
+            
+            conn = sqlite3.connect('predictions.db')
+            c = conn.cursor()
+            for i, row in synthetic.iterrows():
+                c.execute('''
+                    INSERT INTO predictions (timestamp, yr, mnth, hr, holiday, weekday, 
+                                              workingday, weathersit, temp, hum, windspeed, prediction, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (timestamps[i].strftime('%Y-%m-%d %H:%M:%S'), 
+                      int(row['yr']), int(row['mnth']), int(row['hr']), int(row['holiday']),
+                      int(row['weekday']), int(row['workingday']), int(row['weathersit']),
+                      row['temp'], row['hum'], row['windspeed'], predictions[i], 'synthetic'))
+            conn.commit()
+            conn.close()
+            
+            st.success(f'✅ {len(synthetic)} synthetische voorspellingen opgeslagen van {sim_start} tot {sim_end}!')
+        else:
+            st.error('Synthetische dataset niet gevonden.')
 
 # --- Prediction History ---
 st.markdown('---')
@@ -137,17 +144,32 @@ history = get_predictions()
 
 if len(history) > 0:
     st.write(f'Totaal aantal opgeslagen voorspellingen: **{len(history)}**')
-    st.dataframe(history, use_container_width=True)
     
-    # Grafiek met onderscheid tussen handmatig en synthetisch
-    st.subheader('📈 Voorspellingen over tijd')
+    # Datumfilter voor weergave
     history['timestamp'] = pd.to_datetime(history['timestamp'])
-    history = history.sort_values('timestamp')
     
-    manual_data = history[history['source'] == 'manual'][['timestamp', 'prediction']].rename(columns={'prediction': 'Handmatig'}).set_index('timestamp')
-    synth_data = history[history['source'] == 'synthetic'][['timestamp', 'prediction']].rename(columns={'prediction': 'Synthetisch'}).set_index('timestamp')
+    st.write('**Filter op periode:**')
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        view_start = st.date_input('Van', value=history['timestamp'].min().date(), key='view_start')
+    with filter_col2:
+        view_end = st.date_input('Tot', value=history['timestamp'].max().date(), key='view_end')
     
-    chart_df = pd.concat([manual_data, synth_data], axis=1)
-    st.line_chart(chart_df, color=['#FF4B4B', '#4B8BFF'])
+    # Filteren
+    filtered = history[(history['timestamp'].dt.date >= view_start) & (history['timestamp'].dt.date <= view_end)]
+    
+    st.write(f'Voorspellingen in geselecteerde periode: **{len(filtered)}**')
+    st.dataframe(filtered, use_container_width=True)
+    
+    if len(filtered) > 0:
+        # Grafiek met onderscheid tussen handmatig en synthetisch
+        st.subheader('📈 Voorspellingen over tijd')
+        filtered = filtered.sort_values('timestamp')
+        
+        manual_data = filtered[filtered['source'] == 'manual'][['timestamp', 'prediction']].rename(columns={'prediction': 'Handmatig'}).set_index('timestamp')
+        synth_data = filtered[filtered['source'] == 'synthetic'][['timestamp', 'prediction']].rename(columns={'prediction': 'Synthetisch'}).set_index('timestamp')
+        
+        chart_df = pd.concat([manual_data, synth_data], axis=1)
+        st.line_chart(chart_df, color=['#FF4B4B', '#4B8BFF'])
 else:
     st.info('Nog geen voorspellingen opgeslagen. Maak een voorspelling hierboven.')
